@@ -548,6 +548,35 @@ class SessionController:
         self.metrics.current_zone = zone
         self._update_zone_time(zone, dt)
 
+        # --- Zone + Corner detection (simplified NeuroView logic) ---
+
+        cx, cy = body.center_xy
+
+        # ROI boundaries
+        left = rx
+        right = rx + rw
+        top = ry
+        bottom = ry + rh
+
+        # Dynamic margin (20% of the shortest ROI dimension)
+        margin = min(rw, rh) * 0.20
+
+        in_left = cx <= left + margin
+        in_right = cx >= right - margin
+        in_top = cy <= top + margin
+        in_bottom = cy >= bottom - margin
+
+        corner = False
+        if (in_left or in_right) and (in_top or in_bottom):
+            corner = True
+
+        # Override Zone result if corner detected
+        if corner:
+            zone = "Corner"
+
+        self.metrics.current_zone = zone
+
+
         # --- Update windows (valid tracking only) ---
         self._push_window(self.center_buf, body.center_xy, now, max(FREEZE_WINDOW_S, GROOM_WINDOW_S))
         self._push_window(self.head_buf, body.head_xy, now, GROOM_WINDOW_S)
