@@ -1,26 +1,24 @@
 """
-Body Tracking Module for NeuroView
-==================================
+Body Tracking Module for NeuroView (MVP)
+=======================================
 
 Goal:
-- Robust single-animal body pose vectors: Nose (Head), Body (Center), Tail base (Tail)
-- Output must be stable (no teleports), Any-maze-like, and NEVER create "ghost points".
-- If the animal is not detected reliably -> return None (cleanly).
+- Robust, geometry-based single-animal body tracking from a binary foreground mask.
+- Outputs 3 keypoints: Nose (Head), Body (Center), Tail Base (Tail) as vectors.
+- Prevents "ghost points" and prevents head/tail flipping using a strict hierarchy:
+    Priority 1 (Movement): head leads motion (velocity projection)
+    Priority 2 (Morphology): if still, head is thicker end / tail thinner end
+    Priority 3 (Continuity): avoid 180-degree flips frame-to-frame
 
-Key ideas:
-- Contour-based tracking (no deep learning required for MVP).
-- Major axis via PCA on contour points.
-- Endpoints = extremes along PCA axis (guaranteed to be ON contour).
-- Head vs Tail resolution priority:
-    1) Motion: head is endpoint aligned with velocity (when moving).
-    2) Morphology: head is endpoint in thinner region (thickness heuristic).
-    3) Continuity: prevent 180° flips / sudden swaps.
-- Anti-teleport "local anchor": if candidate head/tail jumps > MAX_JUMP_PX vs previous,
-  clamp to previous (and reduce confidence).
+Critical Fix:
+- Adaptive anti-teleport:
+    * If animal is moving, do NOT freeze head/tail to previous positions.
+    * Only clamp when detection is poor or jump is implausible while nearly still.
 
-Public API (HARD CONSTRAINT):
-- BodyState dataclass
-- extract_body_state_from_mask(...) callable from SessionController
+Hard constraint:
+- Head and tail markers lie on the animal contour (after smoothing we snap to contour).
+
+Dependencies: numpy, opencv-python
 """
 
 from __future__ import annotations
@@ -33,57 +31,66 @@ import numpy as np
 import cv2
 
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-MIN_BODY_AREA_PX2 = 180.0
+MIN_BODY_AREA_PX2 = 150.0
 MORPH_KERNEL_SIZE = 5
 
-# Smoothing (EMA) for stable points
-EMA_ALPHA = 0.35
+# EMA (adaptive): higher alpha = more responsive (less lag)
+EMA_ALPHA_STILL = 0.35
+EMA_ALPHA_MOVING = 0.70
 
-# Anti-teleport anchor
-MAX_JUMP_PX = 30.0
+# Motion threshold (ROI-local px per frame) to consider "moving"
+MOTION_CENTER_STEP_PX = 2.0
 
-# Motion threshold: if center moves faster than this, use velocity rule
-MOTION_SPEED_THRESHOLD_PX_PER_S = 5.0
+# Anti-teleport configuration (ROI-local pixels)
+# If nearly still and endpoint jumps too far -> keep previous (avoid corners/reflections)
+MAX_JUMP_WHEN_STILL_PX = 30.0
 
-# Continuity: prevent sudden flip unless strongly supported
-CONTINUITY_MARGIN_PX = 20.0
+# If moving, allow larger corrections (so points don't "stick")
+MAX_JUMP_WHEN_MOVING_PX = 120.0
+
+# Continuity: prevent head/tail flip unless strongly supported
+FLIP_DOT_THRESHOLD = -0.25  # if heading dot < this, it's ~180deg flip
+
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
 
 Point = Tuple[int, int]
 ROIType = Tuple[int, int, int, int]  # (x, y, w, h)
 
 
-# -----------------------------------------------------------------------------
-# Data model
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Dataclass
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BodyState:
     """
-    All coordinates are GLOBAL (frame coordinates).
+    All coordinates are GLOBAL frame coordinates.
     """
     center_xy: Point
-    head_xy: Point   # "nose"/head end
-    tail_xy: Point   # tail base end
-    heading_deg: float  # tail -> head
+    head_xy: Point
+    tail_xy: Point
+    heading_deg: float
     area_px2: float
     length_px: float
     width_px: float
-    confidence: float = 1.0
-    contour_global: Optional[np.ndarray] = None  # Nx1x2 (optional)
+    contour_global: Optional[np.ndarray] = None
     id: int = 0
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def _unit(v: np.ndarray) -> np.ndarray:
     n = float(np.linalg.norm(v))
-    if n < 1e-9:
+    if n <= 1e-9:
         return np.array([1.0, 0.0], dtype=np.float32)
     return (v / n).astype(np.float32)
 
@@ -96,96 +103,182 @@ def _smooth(prev: np.ndarray, new: np.ndarray, alpha: float) -> np.ndarray:
     return alpha * new + (1.0 - alpha) * prev
 
 
+def _snap_to_contour(point_xy: np.ndarray, contour: np.ndarray) -> np.ndarray:
+    """
+    Snap point to the nearest contour point (brute force).
+    Contour shape: (N,1,2) or (N,2).
+    """
+    pts = contour.reshape(-1, 2).astype(np.float32)
+    if pts.size == 0:
+        return point_xy
+    diffs = pts - point_xy
+    d2 = np.sum(diffs * diffs, axis=1)
+    return pts[int(np.argmin(d2))]
+
+
 def _local_width_score(dist_transform: np.ndarray, p_xy: np.ndarray) -> float:
-    """
-    Distance transform returns distance to background.
-    Bigger means thicker (more interior).
-    """
     x = int(round(float(p_xy[0])))
     y = int(round(float(p_xy[1])))
     h, w = dist_transform.shape[:2]
-    if x < 0 or y < 0 or x >= w or y >= h:
+    if x < 0 or x >= w or y < 0 or y >= h:
         return 0.0
     return float(dist_transform[y, x])
 
 
-def _pca_axis(contour_xy: np.ndarray) -> np.ndarray:
+def _min_rect_dims(contour: np.ndarray) -> tuple[float, float]:
+    rect = cv2.minAreaRect(contour)
+    (_, _), (w, h), _ = rect
+    return float(max(w, h)), float(min(w, h))
+
+
+def _pca_axis_and_extremes(contour: np.ndarray, center_roi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    PCA major axis from Nx2 float32 points.
+    PCA axis from contour points; extremes are min/max projection onto axis.
+    Returns: axis_unit (2,), p_min (2,), p_max (2,) in ROI-local coordinates.
     """
-    mu = contour_xy.mean(axis=0, keepdims=True)
-    X = contour_xy - mu
+    pts = contour.reshape(-1, 2).astype(np.float32)
+    if len(pts) < 3:
+        axis = np.array([1.0, 0.0], dtype=np.float32)
+        return axis, center_roi.copy(), center_roi.copy()
+
+    mean = pts.mean(axis=0, keepdims=True)
+    X = pts - mean
     C = np.cov(X.T)
-    if C.shape != (2, 2):
-        return np.array([1.0, 0.0], dtype=np.float32)
+    if C.ndim != 2:
+        axis = np.array([1.0, 0.0], dtype=np.float32)
+        return axis, pts[0], pts[-1]
+
     eigvals, eigvecs = np.linalg.eig(C)
     idx = int(np.argmax(np.real(eigvals)))
     axis = np.real(eigvecs[:, idx]).astype(np.float32)
-    return _unit(axis)
+    axis = _unit(axis)
+
+    proj = (pts - center_roi) @ axis  # (N,)
+    p_min = pts[int(np.argmin(proj))]
+    p_max = pts[int(np.argmax(proj))]
+    return axis, p_min, p_max
 
 
-def _contour_extremes_along_axis(contour_xy: np.ndarray, center_xy: np.ndarray, axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _decide_head_tail(
+    center_roi: np.ndarray,
+    p_min: np.ndarray,
+    p_max: np.ndarray,
+    cleaned_mask_255: np.ndarray,
+    prev_state: Optional[BodyState],
+    rx: int,
+    ry: int,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Project contour points onto axis relative to center, pick min/max.
-    Both returned points lie on contour.
+    Hierarchy:
+    1) Movement: head leads velocity (center delta)
+    2) Morphology: thinner end => tail (thickness heuristic)
+    3) Continuity: prevent 180deg flip unless justified
     """
-    vecs = contour_xy - center_xy
-    proj = vecs @ axis  # Nx
-    i_min = int(np.argmin(proj))
-    i_max = int(np.argmax(proj))
-    return contour_xy[i_min].copy(), contour_xy[i_max].copy()
+    # Default candidates
+    c1 = p_min.astype(np.float32)
+    c2 = p_max.astype(np.float32)
+
+    # Compute velocity (ROI-local) from prev center -> current center
+    v = None
+    moving = False
+    if prev_state is not None:
+        prev_c = np.array([prev_state.center_xy[0] - rx, prev_state.center_xy[1] - ry], dtype=np.float32)
+        v = center_roi - prev_c
+        moving = float(np.linalg.norm(v)) >= MOTION_CENTER_STEP_PX
+
+    if moving and v is not None:
+        v_u = _unit(v)
+        # pick endpoint that has higher dot with velocity direction (leads motion)
+        d1 = float(np.dot(_unit(c1 - center_roi), v_u))
+        d2 = float(np.dot(_unit(c2 - center_roi), v_u))
+        if d1 >= d2:
+            head, tail = c1, c2
+        else:
+            head, tail = c2, c1
+        return head, tail
+
+    # Not moving: thickness heuristic
+    dist = cv2.distanceTransform((cleaned_mask_255 > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    # sample slightly inward from each endpoint
+    s1 = c1 + _unit(center_roi - c1) * 5.0
+    s2 = c2 + _unit(center_roi - c2) * 5.0
+    th1 = _local_width_score(dist, s1)
+    th2 = _local_width_score(dist, s2)
+
+    # Tail is usually thinner
+    if th1 < th2:
+        tail, head = c1, c2
+    else:
+        tail, head = c2, c1
+
+    # Continuity: prevent sudden flip if prev heading exists
+    if prev_state is not None:
+        prev_h = np.array([prev_state.head_xy[0] - rx, prev_state.head_xy[1] - ry], dtype=np.float32)
+        prev_t = np.array([prev_state.tail_xy[0] - rx, prev_state.tail_xy[1] - ry], dtype=np.float32)
+        prev_dir = _unit(prev_h - prev_t)
+        new_dir = _unit(head - tail)
+        dot = float(np.dot(prev_dir, new_dir))
+        # if strong flip (~180deg), keep previous assignment (swap)
+        if dot < FLIP_DOT_THRESHOLD:
+            head, tail = tail, head
+
+    return head, tail
 
 
-def _apply_local_anchor(prev_pt: np.ndarray, new_pt: np.ndarray, max_jump_px: float) -> Tuple[np.ndarray, float]:
+def _apply_anti_teleport(
+    head: np.ndarray,
+    tail: np.ndarray,
+    center_roi: np.ndarray,
+    prev_state: Optional[BodyState],
+    rx: int,
+    ry: int,
+) -> tuple[np.ndarray, np.ndarray, bool]:
     """
-    If new point jumps too far from prev, keep prev and reduce confidence.
-    Returns (pt, confidence_factor).
+    If nearly still and the new head/tail jump too far, keep previous points.
+    If moving, allow much larger jumps so points don't "stick" behind.
+    Returns (head, tail, moving)
     """
-    d = float(np.linalg.norm(new_pt - prev_pt))
-    if d > max_jump_px:
-        return prev_pt.copy(), 0.35
-    return new_pt, 1.0
+    if prev_state is None:
+        return head, tail, False
+
+    prev_c = np.array([prev_state.center_xy[0] - rx, prev_state.center_xy[1] - ry], dtype=np.float32)
+    prev_h = np.array([prev_state.head_xy[0] - rx, prev_state.head_xy[1] - ry], dtype=np.float32)
+    prev_t = np.array([prev_state.tail_xy[0] - rx, prev_state.tail_xy[1] - ry], dtype=np.float32)
+
+    v = center_roi - prev_c
+    moving = float(np.linalg.norm(v)) >= MOTION_CENTER_STEP_PX
+
+    max_jump = MAX_JUMP_WHEN_MOVING_PX if moving else MAX_JUMP_WHEN_STILL_PX
+
+    if float(np.linalg.norm(head - prev_h)) > max_jump:
+        head = prev_h
+    if float(np.linalg.norm(tail - prev_t)) > max_jump:
+        tail = prev_t
+
+    return head, tail, moving
 
 
-def _min_area_rect_dims(contour: np.ndarray) -> Tuple[float, float]:
-    rect = cv2.minAreaRect(contour)
-    (_, _), (w, h), _ = rect
-    length_px = float(max(w, h))
-    width_px = float(min(w, h))
-    return length_px, width_px
-
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Core extraction
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def extract_body_state(
     roi_xywh: ROIType,
     fg_mask_roi_255: np.ndarray,
     prev_state: Optional[BodyState],
-    *,
-    now_s: Optional[float] = None,
-    prev_time_s: Optional[float] = None,
 ) -> Optional[BodyState]:
-    """
-    Compute BodyState from ROI-local foreground mask (0/255).
-    Returns None when detection is not reliable.
-    """
     rx, ry, rw, rh = roi_xywh
 
     if fg_mask_roi_255 is None or fg_mask_roi_255.size == 0:
         return None
 
     # --- Clean mask ---
-    mask = fg_mask_roi_255.copy()
-    mask = cv2.medianBlur(mask, 5)
-
+    cleaned = cv2.medianBlur(fg_mask_roi_255, 5)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, k, iterations=1)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, k, iterations=2)
 
-    # --- Contour ---
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
@@ -194,107 +287,56 @@ def extract_body_state(
     if area < MIN_BODY_AREA_PX2:
         return None
 
-    # --- Center (ROI-local) ---
+    # --- Center (moments) ---
     M = cv2.moments(contour)
-    if float(M.get("m00", 0.0)) < 1e-9:
+    if M.get("m00", 0.0) <= 1e-9:
         x, y, w, h = cv2.boundingRect(contour)
-        center_roi = np.array([x + w / 2.0, y + h / 2.0], dtype=np.float32)
+        cx_roi = x + w / 2.0
+        cy_roi = y + h / 2.0
     else:
-        center_roi = np.array([float(M["m10"]) / float(M["m00"]), float(M["m01"]) / float(M["m00"])], dtype=np.float32)
+        cx_roi = float(M["m10"] / M["m00"])
+        cy_roi = float(M["m01"] / M["m00"])
 
-    # Contour points Nx2
-    pts = contour.reshape(-1, 2).astype(np.float32)
-    if pts.shape[0] < 10:
-        return None
+    center_roi = np.array([cx_roi, cy_roi], dtype=np.float32)
 
-    # --- PCA axis and extremes on contour ---
-    axis = _pca_axis(pts)
-    p1_roi, p2_roi = _contour_extremes_along_axis(pts, center_roi, axis)
+    # --- PCA axis + extremes (ON contour) ---
+    _, p_min, p_max = _pca_axis_and_extremes(contour, center_roi)
 
-    # --- Thickness heuristic (for "quiet" cases) ---
-    dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    # --- Head/Tail decision ---
+    head_roi, tail_roi = _decide_head_tail(center_roi, p_min, p_max, cleaned, prev_state, rx, ry)
 
-    # Sample a few pixels inward from each endpoint to measure thickness
-    d1 = _unit(center_roi - p1_roi)
-    d2 = _unit(center_roi - p2_roi)
-    s1 = p1_roi + d1 * 6.0
-    s2 = p2_roi + d2 * 6.0
-    th1 = _local_width_score(dist, s1)
-    th2 = _local_width_score(dist, s2)
+    # --- Anti-teleport (adaptive) ---
+    head_roi, tail_roi, moving = _apply_anti_teleport(head_roi, tail_roi, center_roi, prev_state, rx, ry)
 
-    # Default: tail is thinner, head is thicker (often true; can fail on extreme poses)
-    # We'll override with motion rule when moving.
-    if th1 < th2:
-        tail_cand = p1_roi
-        head_cand = p2_roi
-    else:
-        tail_cand = p2_roi
-        head_cand = p1_roi
-
-    confidence = 1.0
-
-    # --- Motion rule (Priority 1) ---
-    # If animal is moving, head is the endpoint aligned with velocity direction.
-    if prev_state is not None and now_s is not None and prev_time_s is not None:
-        dt = max(1e-6, float(now_s - prev_time_s))
-        prev_center_roi = np.array([prev_state.center_xy[0] - rx, prev_state.center_xy[1] - ry], dtype=np.float32)
-        v = (center_roi - prev_center_roi) / dt
-        speed = float(np.linalg.norm(v))
-
-        if speed >= MOTION_SPEED_THRESHOLD_PX_PER_S:
-            vhat = _unit(v)
-            # Compare which endpoint is more aligned with velocity from center
-            e1 = _unit(p1_roi - center_roi)
-            e2 = _unit(p2_roi - center_roi)
-            score1 = float(e1 @ vhat)
-            score2 = float(e2 @ vhat)
-            # Head = endpoint with higher alignment to velocity
-            if score1 > score2:
-                head_cand, tail_cand = p1_roi, p2_roi
-            else:
-                head_cand, tail_cand = p2_roi, p1_roi
-
-    # --- Continuity rule (Priority 3) ---
-    # Avoid sudden head swap unless clearly better.
+    # --- Adaptive smoothing (so it follows immediately when moving) ---
+    alpha = EMA_ALPHA_MOVING if moving else EMA_ALPHA_STILL
     if prev_state is not None:
-        prev_head_roi = np.array([prev_state.head_xy[0] - rx, prev_state.head_xy[1] - ry], dtype=np.float32)
-        prev_tail_roi = np.array([prev_state.tail_xy[0] - rx, prev_state.tail_xy[1] - ry], dtype=np.float32)
+        prev_c = np.array([prev_state.center_xy[0] - rx, prev_state.center_xy[1] - ry], dtype=np.float32)
+        prev_h = np.array([prev_state.head_xy[0] - rx, prev_state.head_xy[1] - ry], dtype=np.float32)
+        prev_t = np.array([prev_state.tail_xy[0] - rx, prev_state.tail_xy[1] - ry], dtype=np.float32)
 
-        d_head_to_p1 = float(np.linalg.norm(p1_roi - prev_head_roi))
-        d_head_to_p2 = float(np.linalg.norm(p2_roi - prev_head_roi))
+        center_roi = _smooth(prev_c, center_roi, alpha * 0.6)  # center slightly smoother
+        head_roi = _smooth(prev_h, head_roi, alpha)
+        tail_roi = _smooth(prev_t, tail_roi, alpha)
 
-        # If one endpoint is significantly closer to previous head, enforce it.
-        if d_head_to_p1 + CONTINUITY_MARGIN_PX < d_head_to_p2:
-            head_cand, tail_cand = p1_roi, p2_roi
-        elif d_head_to_p2 + CONTINUITY_MARGIN_PX < d_head_to_p1:
-            head_cand, tail_cand = p2_roi, p1_roi
+    # --- Snap head/tail to contour after smoothing (hard constraint) ---
+    head_roi = _snap_to_contour(head_roi, contour)
+    tail_roi = _snap_to_contour(tail_roi, contour)
 
-        # Anti-teleport local anchor (HARD FIX)
-        head_cand, c1 = _apply_local_anchor(prev_head_roi, head_cand, MAX_JUMP_PX)
-        tail_cand, c2 = _apply_local_anchor(prev_tail_roi, tail_cand, MAX_JUMP_PX)
-        confidence *= min(c1, c2)
-
-        # Smooth AFTER anchoring
-        head_cand = _smooth(prev_head_roi, head_cand, EMA_ALPHA)
-        tail_cand = _smooth(prev_tail_roi, tail_cand, EMA_ALPHA)
-        center_roi = _smooth(prev_center_roi, center_roi, EMA_ALPHA)
-
-    # --- Build outputs (GLOBAL coords) ---
-    center_g = (int(round(rx + float(center_roi[0]))), int(round(ry + float(center_roi[1]))))
-    head_g = (int(round(rx + float(head_cand[0]))), int(round(ry + float(head_cand[1]))))
-    tail_g = (int(round(rx + float(tail_cand[0]))), int(round(ry + float(tail_cand[1]))))
-
-    heading_vec = np.array([head_g[0] - tail_g[0], head_g[1] - tail_g[1]], dtype=np.float32)
+    # Heading tail->head
+    heading_vec = head_roi - tail_roi
     heading_deg = _angle_deg(heading_vec)
 
-    length_px, width_px = _min_area_rect_dims(contour)
+    length_px, width_px = _min_rect_dims(contour)
+
+    # --- Convert to global ---
+    center_g = (int(round(rx + float(center_roi[0]))), int(round(ry + float(center_roi[1]))))
+    head_g = (int(round(rx + float(head_roi[0]))), int(round(ry + float(head_roi[1]))))
+    tail_g = (int(round(rx + float(tail_roi[0]))), int(round(ry + float(tail_roi[1]))))
 
     contour_global = contour.copy()
-    contour_global[:, :, 0] += int(rx)
-    contour_global[:, :, 1] += int(ry)
-
-    # NOTE: we do NOT force points to contour here to avoid wrong snapping when mask is noisy.
-    # We rely on local anchor + smoothing. UI will fade if confidence is low.
+    contour_global[:, :, 0] += rx
+    contour_global[:, :, 1] += ry
 
     return BodyState(
         center_xy=center_g,
@@ -304,35 +346,28 @@ def extract_body_state(
         area_px2=area,
         length_px=length_px,
         width_px=width_px,
-        confidence=float(max(0.0, min(confidence, 1.0))),
         contour_global=contour_global,
-        id=0,
+        id=0
     )
 
 
-# -----------------------------------------------------------------------------
-# Backwards-compatible public API
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Backwards-Compatible API (used by SessionController)
+# ---------------------------------------------------------------------------
 
 def extract_body_state_from_mask(
     *,
-    frame_bgr: Optional[np.ndarray] = None,  # kept for compatibility; unused in MVP geometry tracker
+    frame_bgr: Optional[np.ndarray] = None,   # kept for compatibility (not used here)
     roi_xywh: ROIType,
     fg_mask_roi: np.ndarray,
     prev_state: Optional[BodyState],
-    now_s: Optional[float] = None,
-    prev_time_s: Optional[float] = None,
 ) -> Optional[BodyState]:
     """
-    Compatibility wrapper used by SessionController.
-
-    IMPORTANT:
-    - Must return None cleanly when no animal is detected (prevents ghost points).
+    Public API used by SessionController.
+    Must return None cleanly when no animal is detected.
     """
     return extract_body_state(
         roi_xywh=roi_xywh,
         fg_mask_roi_255=fg_mask_roi,
         prev_state=prev_state,
-        now_s=now_s,
-        prev_time_s=prev_time_s,
     )

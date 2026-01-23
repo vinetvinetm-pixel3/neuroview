@@ -5,11 +5,15 @@ SessionController (MVP - Vector Tracking)
 - ROI provided by GUI (no OpenCV windows)
 - Tracking via body_tracking.py (Contour-PCA based)
 - Behaviors:
-    - Freezing: low center motion + low heading variance (windowed)
-    - Grooming: stable center + head oscillation (windowed)
+    - Freezing: low center motion + low heading variance (windowed + min duration)
+    - Grooming: stable center + head oscillation (windowed + min duration)
 - Zones:
     - Open Field: Center vs Periphery (ratio-based inner rectangle)
 - Export: CSV/PDF
+
+Design:
+- Core contains no GUI calls.
+- If tracking is lost, we return the raw frame and keep metrics stable.
 """
 
 from __future__ import annotations
@@ -34,20 +38,29 @@ ROIType = Tuple[int, int, int, int]  # (x, y, w, h)
 # Behavior configuration (tunable)
 # -----------------------------------------------------------------------------
 
+# --- Freezing ---
 FREEZE_MIN_DURATION_S = 2.0
 FREEZE_WINDOW_S = 2.0
-FREEZE_CENTER_DISP_PX = 3.0               # max displacement in window
-FREEZE_HEADING_VAR_DEG2 = 25.0            # variance threshold (deg^2)
+FREEZE_CENTER_DISP_PX = 3.0            # max center displacement inside window
+FREEZE_HEADING_VAR_DEG2 = 25.0         # variance threshold (deg^2)
 
+# --- Grooming ---
 GROOM_MIN_DURATION_S = 1.5
 GROOM_WINDOW_S = 1.5
-GROOM_CENTER_DISP_PX = 5.0                # stays mostly in place
-GROOM_HEAD_OSC_PX = 8.0                   # head moves around while center stays
-GROOM_HEADING_VAR_MIN_DEG2 = 40.0         # heading variance typically higher during grooming
+GROOM_CENTER_DISP_PX = 5.0             # center stays mostly in place
+GROOM_HEAD_OSC_PX = 8.0                # head moves around while center stays
+GROOM_HEADING_VAR_MIN_DEG2 = 40.0      # heading variance usually higher during grooming
 
+# --- Movement classification ---
 MOVEMENT_SPEED_THRESHOLD_PX_S = 3.0
 
+# --- Zones ---
 ZONE_CENTER_AREA_RATIO = 0.55
+
+# --- Tracking robustness ---
+# If body tracking returns None for too many consecutive frames, drop continuity lock
+# so reacquisition is fast when the animal reappears.
+MAX_LOST_FRAMES_BEFORE_RESET = 10
 
 
 @dataclass
@@ -74,22 +87,25 @@ class Metrics:
 
 class ZoneModel:
     """
-    Simple Open Field zone model: Center vs Periphery based on inner rectangle area ratio.
+    Simple Open Field zone model:
+    - Center: inner rectangle whose AREA is center_area_ratio of ROI area.
+    - Periphery: rest.
     """
     def __init__(self, roi: ROIType, center_area_ratio: float = ZONE_CENTER_AREA_RATIO):
         rx, ry, rw, rh = roi
-        self.rx, self.ry, self.rw, self.rh = rx, ry, rw, rh
-        s = math.sqrt(center_area_ratio)
-        cw = rw * s
-        ch = rh * s
-        self.x1 = (rw - cw) / 2.0
-        self.y1 = (rh - ch) / 2.0
+        self.rx, self.ry, self.rw, self.rh = int(rx), int(ry), int(rw), int(rh)
+
+        s = math.sqrt(float(center_area_ratio))
+        cw = self.rw * s
+        ch = self.rh * s
+        self.x1 = (self.rw - cw) / 2.0
+        self.y1 = (self.rh - ch) / 2.0
         self.x2 = self.x1 + cw
         self.y2 = self.y1 + ch
 
     def classify(self, x_global: float, y_global: float) -> str:
-        lx = x_global - self.rx
-        ly = y_global - self.ry
+        lx = float(x_global) - float(self.rx)
+        ly = float(y_global) - float(self.ry)
         if self.x1 <= lx <= self.x2 and self.y1 <= ly <= self.y2:
             return "Center"
         return "Periphery"
@@ -97,38 +113,51 @@ class ZoneModel:
 
 class SessionController:
     def __init__(self) -> None:
+        # FPS handling
         self.video_fps: float = 30.0
         self.frame_interval_s: float = 1.0 / self.video_fps
 
+        # Capture
         self.cap: Optional[cv2.VideoCapture] = None
         self.source: Optional[SourceType] = None
 
+        # Run state
         self.running: bool = False
         self.paused: bool = False
 
+        # Timing
         self.start_time: Optional[float] = None
         self._last_t: Optional[float] = None
 
+        # ROI / Zones
         self.roi: Optional[ROIType] = None
         self.roi_defined: bool = False
         self.zone_model: Optional[ZoneModel] = None
 
+        # Background subtractor
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=16, detectShadows=True
         )
 
+        # Last frame & metrics
         self.last_frame: Optional[np.ndarray] = None
         self.metrics = Metrics()
 
-        # Tracking
+        # Tracking (single animal)
         self.prev_body: Optional[BodyState] = None
         self.last_body: Optional[BodyState] = None
+        self._lost_frames: int = 0
 
-        # Histories (window buffers)
+        # Histories (sliding windows)
         self.center_buf: deque[Tuple[Tuple[int, int], float]] = deque()
         self.head_buf: deque[Tuple[Tuple[int, int], float]] = deque()
         self.heading_buf: deque[Tuple[float, float]] = deque()
 
+        # Behavior state machines (durations)
+        self._freeze_candidate_start: Optional[float] = None
+        self._groom_candidate_start: Optional[float] = None
+
+        # Export data
         self.tracking_records: List[Dict[str, Any]] = []
 
     # -------------------------------------------------------------------------
@@ -141,13 +170,13 @@ class SessionController:
         self.roi = (int(x), int(y), int(w), int(h))
         self.roi_defined = True
         self.zone_model = ZoneModel(self.roi)
-        self._reset_runtime_stats()
+        self._reset_runtime_stats(keep_time=False)
 
     def clear_roi(self) -> None:
         self.roi = None
         self.roi_defined = False
         self.zone_model = None
-        self._reset_runtime_stats()
+        self._reset_runtime_stats(keep_time=False)
 
     # -------------------------------------------------------------------------
     # Sources
@@ -185,17 +214,19 @@ class SessionController:
         self.reset_for_new_source()
 
     def reset_for_new_source(self) -> None:
+        # Do not clear ROI here (GUI controls ROI)
         self.running = False
         self.paused = False
         self.start_time = None
         self._last_t = None
 
-        self._reset_runtime_stats()
+        self._reset_runtime_stats(keep_time=False)
 
         self.prev_body = None
         self.last_body = None
         self.last_frame = None
         self.tracking_records.clear()
+        self._lost_frames = 0
 
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=16, detectShadows=True
@@ -208,10 +239,20 @@ class SessionController:
         if self.source != "video" or self.cap is None:
             return
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        # Reset runtime (keep ROI)
         self.prev_body = None
         self.last_body = None
-        self._reset_runtime_stats()
         self.tracking_records.clear()
+        self._lost_frames = 0
+
+        self._reset_runtime_stats(keep_time=False)
+
+        # Reset bg model
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=16, detectShadows=True
+        )
+
         self.read_first_frame()
 
     def read_first_frame(self) -> Optional[np.ndarray]:
@@ -234,18 +275,19 @@ class SessionController:
         if not self.roi_defined or self.roi is None:
             raise RuntimeError("ROI not defined.")
 
-        # IMPORTANT: do not call reset_for_new_source() here because it clears ROI.
         self.running = True
         self.paused = False
         self.start_time = time.time()
         self._last_t = self.start_time
 
-        # Reset tracking + stats, keep ROI and source intact
-        self._reset_runtime_stats()
+        # Reset runtime, keep ROI and source
+        self._reset_runtime_stats(keep_time=False)
         self.prev_body = None
         self.last_body = None
         self.tracking_records.clear()
+        self._lost_frames = 0
 
+        # Fresh bg model
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
             history=500, varThreshold=16, detectShadows=True
         )
@@ -284,7 +326,7 @@ class SessionController:
         ys = [r["center_y_px"] for r in self.tracking_records]
 
         with PdfPages(path) as pdf:
-            # Summary page
+            # Summary
             fig = plt.figure(figsize=(8.5, 6))
             txt = (
                 "NeuroView Report\n\n"
@@ -310,13 +352,23 @@ class SessionController:
             plt.close(fig2)
 
     # -------------------------------------------------------------------------
-    # Internal stats/behavior helpers
+    # Internal helpers
     # -------------------------------------------------------------------------
-    def _reset_runtime_stats(self) -> None:
+    def _reset_runtime_stats(self, keep_time: bool = False) -> None:
+        """
+        Reset metrics + buffers. If keep_time=True, preserves elapsed time counters.
+        """
+        prev_elapsed = self.metrics.elapsed_time_s if keep_time else 0.0
+
         self.metrics = Metrics()
+        self.metrics.elapsed_time_s = prev_elapsed
+
         self.center_buf.clear()
         self.head_buf.clear()
         self.heading_buf.clear()
+
+        self._freeze_candidate_start = None
+        self._groom_candidate_start = None
 
     def _push_window(self, buf: deque, value, now: float, window_s: float) -> None:
         buf.append((value, now))
@@ -348,6 +400,58 @@ class SessionController:
             self.metrics.time_center_s += max(0.0, dt)
         elif zone == "Periphery":
             self.metrics.time_periphery_s += max(0.0, dt)
+
+    def _behavior_freezing_update(self, candidate: bool, now: float, dt: float) -> None:
+        """
+        Freezing state machine:
+        - Candidate must be sustained for FREEZE_MIN_DURATION_S.
+        - Once active, accumulates time while candidate remains true.
+        """
+        if not candidate:
+            self.metrics.freezing_active = False
+            self._freeze_candidate_start = None
+            return
+
+        # candidate is true
+        if self._freeze_candidate_start is None:
+            self._freeze_candidate_start = now
+            self.metrics.freezing_active = False
+            return
+
+        if (now - self._freeze_candidate_start) >= FREEZE_MIN_DURATION_S:
+            self.metrics.freezing_active = True
+            self.metrics.freezing_time_s += max(0.0, dt)
+        else:
+            self.metrics.freezing_active = False
+
+    def _behavior_grooming_update(self, candidate: bool, now: float, dt: float) -> None:
+        """
+        Grooming state machine:
+        - Candidate must be sustained for GROOM_MIN_DURATION_S.
+        - Once active, accumulates time while candidate remains true.
+        - Mutually exclusive with freezing.
+        """
+        if self.metrics.freezing_active:
+            self.metrics.grooming_active = False
+            self._groom_candidate_start = None
+            return
+
+        if not candidate:
+            self.metrics.grooming_active = False
+            self._groom_candidate_start = None
+            return
+
+        # candidate is true
+        if self._groom_candidate_start is None:
+            self._groom_candidate_start = now
+            self.metrics.grooming_active = False
+            return
+
+        if (now - self._groom_candidate_start) >= GROOM_MIN_DURATION_S:
+            self.metrics.grooming_active = True
+            self.metrics.grooming_time_s += max(0.0, dt)
+        else:
+            self.metrics.grooming_active = False
 
     # -------------------------------------------------------------------------
     # Main processing
@@ -382,6 +486,7 @@ class SessionController:
         roi_frame = frame[ry:ry + rh, rx:rx + rw]
         gray = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
 
+        # Foreground mask
         fg = self.bg_subtractor.apply(gray)
         fg = cv2.medianBlur(fg, 5)
         _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
@@ -392,21 +497,31 @@ class SessionController:
             roi_xywh=(rx, ry, rw, rh),
             fg_mask_roi=fg,
             prev_state=self.prev_body,
-            now_s=now,
-            prev_time_s=(self._last_t - dt) if dt > 0 else None,
         )
 
-        # Clean handling: if no detection -> do not update prev_body, do not append buffers
-        # This prevents ghost points and broken behaviors.
+        # If no detection: do not update buffers/records and avoid ghost points.
         if body is None:
             self.last_body = None
-            # We still return raw frame for display, but no pose is drawn by GUI.
+            self._lost_frames += 1
+
+            # After several lost frames, drop continuity lock for fast reacquisition.
+            if self._lost_frames >= MAX_LOST_FRAMES_BEFORE_RESET:
+                self.prev_body = None
+
+            # Behaviors should not accumulate while we are blind.
+            self.metrics.freezing_active = False
+            self.metrics.grooming_active = False
+            self._freeze_candidate_start = None
+            self._groom_candidate_start = None
+
             return frame
 
+        # Tracking recovered
+        self._lost_frames = 0
         self.prev_body = body
         self.last_body = body
 
-        # --- Kinematics ---
+        # --- Kinematics / speed ---
         speed = 0.0
         if len(self.center_buf) > 0:
             prev_center = np.array(self.center_buf[-1][0], dtype=np.float32)
@@ -433,41 +548,30 @@ class SessionController:
         self.metrics.current_zone = zone
         self._update_zone_time(zone, dt)
 
-        # --- Behavior buffers (only when detection is valid) ---
+        # --- Update windows (valid tracking only) ---
         self._push_window(self.center_buf, body.center_xy, now, max(FREEZE_WINDOW_S, GROOM_WINDOW_S))
         self._push_window(self.head_buf, body.head_xy, now, GROOM_WINDOW_S)
         self._push_window(self.heading_buf, body.heading_deg, now, FREEZE_WINDOW_S)
 
-        # --- FREEZING: low center displacement + low heading variance for >= duration ---
+        # --- Window statistics ---
         c_disp = self._window_disp(self.center_buf)
         h_var = self._window_var(self.heading_buf)
-
-        freeze_candidate = (c_disp <= FREEZE_CENTER_DISP_PX) and (h_var <= FREEZE_HEADING_VAR_DEG2)
-
-        if freeze_candidate and self.metrics.elapsed_time_s >= FREEZE_MIN_DURATION_S:
-            # Require sustained candidate: simplest method = candidate in window
-            # (for MVP). More formal: state machine with timer.
-            self.metrics.freezing_active = True
-            self.metrics.freezing_time_s += max(0.0, dt)
-        else:
-            self.metrics.freezing_active = False
-
-        # --- GROOMING: center stable + head oscillation + heading variance above minimum ---
-        # This avoids false positives where mouse is just quiet.
         head_disp = self._window_disp(self.head_buf)
 
+        # --- Freezing candidate ---
+        freeze_candidate = (c_disp <= FREEZE_CENTER_DISP_PX) and (h_var <= FREEZE_HEADING_VAR_DEG2)
+        self._behavior_freezing_update(freeze_candidate, now, dt)
+
+        # --- Grooming candidate ---
+        # Key idea: stable center + head oscillation + enough heading variability,
+        # and not freezing.
         groom_candidate = (
             (c_disp <= GROOM_CENTER_DISP_PX) and
             (head_disp >= GROOM_HEAD_OSC_PX) and
             (h_var >= GROOM_HEADING_VAR_MIN_DEG2) and
             (not self.metrics.freezing_active)
         )
-
-        if groom_candidate and self.metrics.elapsed_time_s >= GROOM_MIN_DURATION_S:
-            self.metrics.grooming_active = True
-            self.metrics.grooming_time_s += max(0.0, dt)
-        else:
-            self.metrics.grooming_active = False
+        self._behavior_grooming_update(groom_candidate, now, dt)
 
         # --- Record ---
         self.tracking_records.append({
@@ -484,7 +588,6 @@ class SessionController:
             "speed_px_per_s": speed,
             "freezing": int(self.metrics.freezing_active),
             "grooming": int(self.metrics.grooming_active),
-            "confidence": float(getattr(body, "confidence", 1.0)),
         })
 
         return frame
