@@ -612,97 +612,149 @@ class MainWindow(ctk.CTk):
         self.after(delay_ms, self._schedule_next_frame)
 
     # -------------------------------------------------------------------------
-    # Any-maze-like overlay drawing (NO contours)
+    # Overlay drawing (NO contours)
     # -------------------------------------------------------------------------
     @staticmethod
-    def _draw_pose_overlay(frame_bgr: np.ndarray, body: Optional[object]) -> np.ndarray:
+    def _draw_pose_overlay(frame_bgr: np.ndarray, body) -> np.ndarray:
         """
-        Draw only the pose vectors:
-        - Line: nose->center
-        - Line: center->tail
-        - 3 circles for points
-        Uses confidence to fade when uncertain.
+        Draw only the pose vectors (nose → center → tail)
+        with 3 subtle circular markers.
+        No segmentation contours.
+        Fade out if confidence is low.
         """
         if body is None:
             return frame_bgr
 
-        # Extract points
-        nose = tuple(map(int, body.head_xy))
-        center = tuple(map(int, body.center_xy))
-        tail = tuple(map(int, body.tail_xy))
+       # Convert pose points from original-frame coordinates → resized-frame coordinates
+        try:
+            from inspect import currentframe
+            self_obj = currentframe().f_back.f_locals.get('self', None)
+            scale = getattr(self_obj, "_render_scale", 1.0)
+        except:
+            scale = 1.0
 
+        # Apply uniform scale
+        nose = (int(body.head_xy[0] * scale),   int(body.head_xy[1] * scale))
+        center = (int(body.center_xy[0] * scale), int(body.center_xy[1] * scale))
+        tail = (int(body.tail_xy[0] * scale),    int(body.tail_xy[1] * scale))
+
+        # Confidence value (if available)
         conf = float(getattr(body, "confidence", 1.0))
         conf = max(0.0, min(conf, 1.0))
 
-        # Fade rule: if confidence too low, don't draw at all (prevents misleading UI)
+        # If tracking unsure → do not draw to avoid wrong UI
         if conf < 0.35:
             return frame_bgr
 
-        # Create overlay for alpha blending
         overlay = frame_bgr.copy()
 
-        # Professional, subtle colors (BGR)
-        nose_col = (80, 255, 120)     # neon green-ish
-        center_col = (255, 170, 60)   # warm blue-ish? (note BGR order)
-        tail_col = (255, 255, 120)    # soft cyan
+        # Professional color palette (BGR)
+        nose_col   = (80, 255, 120)      # mint green
+        center_col = (255, 180, 80)      # warm soft orange
+        tail_col   = (255, 255, 150)     # pale yellow
+        line_col   = (240, 240, 240)     # light gray
 
-        line_col = (240, 240, 240)    # light gray
+        # -------------------------------------------------------------
+        # ⭐ FIX: Scaled marker radius based on displayed video size
+        # -------------------------------------------------------------
+        # The original r = min(h,w)*0.006 caused huge circles on big videos.
+        # Now we scale inversely with render_scale computed in _render_frame.
+        try:
+            # Access render_scale from bound instance
+            from inspect import currentframe
+            self_obj = currentframe().f_back.f_locals.get('self', None)
+            scale = getattr(self_obj, "_render_scale", 1.0)
+        except Exception:
+            scale = 1.0  # safe fallback
 
-        # Thin lines
-        cv2.line(overlay, nose, center, line_col, 1, cv2.LINE_AA)
-        cv2.line(overlay, center, tail, line_col, 1, cv2.LINE_AA)
+        # Marker radius — constant visual size on screen
+        # Example: scale=0.25 (1080p→270p) →  r ≈ 24px
+        # scale=1.0 (native small video) →    r ≈ 6px
+        base_radius = 6
+        r = max(3, int(base_radius / max(scale, 0.8)) + 1,5)
 
-        # Radius scales with image size a bit
-        h, w = frame_bgr.shape[:2]
-        r = max(3, int(min(h, w) * 0.006))
+        # -------------------------------------------------------------
+        # Draw vectors
+        # -------------------------------------------------------------
+        cv2.line(overlay, nose, center, line_col, 2, cv2.LINE_AA)
+        cv2.line(overlay, center, tail, line_col, 2, cv2.LINE_AA)
 
-        # Draw circles with anti-aliasing
-        cv2.circle(overlay, nose, r, nose_col, -1, cv2.LINE_AA)
+        # Draw markers (scaled)
+        cv2.circle(overlay, nose,   r, nose_col,   -1, cv2.LINE_AA)
         cv2.circle(overlay, center, r, center_col, -1, cv2.LINE_AA)
-        cv2.circle(overlay, tail, r, tail_col, -1, cv2.LINE_AA)
+        cv2.circle(overlay, tail,   r, tail_col,   -1, cv2.LINE_AA)
 
-        # Alpha depends on confidence (subtle fade)
+        # Alpha-blend based on confidence
         alpha = 0.35 + 0.65 * conf
-        cv2.addWeighted(overlay, alpha, frame_bgr, 1.0 - alpha, 0.0, frame_bgr)
-        return frame_bgr
+        return cv2.addWeighted(overlay, alpha, frame_bgr, 1 - alpha, 0)
 
+    
     # -------------------------------------------------------------------------
     # Render frame
     # -------------------------------------------------------------------------
+        # -------------------------------------------------------------------------
+    # Render frame  (FINAL FIXED VERSION)
+    # -------------------------------------------------------------------------
     def _render_frame(self, frame_bgr: np.ndarray) -> None:
-        # Draw pose overlay (no contours)
-        frame_bgr = self._draw_pose_overlay(frame_bgr, self.controller.last_body)
+        """
+        Correct rendering pipeline:
+        1) Convert original frame to RGB
+        2) Resize
+        3) Draw vectors (nose→center→tail) on RESIZED frame
+        4) Paste into canvas
+        """
 
+        # 1) Convert BGR → RGB for PIL
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
-        self._render_src_w, self._render_src_h = img.size
 
+        # Save source resolution
+        self._render_src_w, self._render_src_h = frame_rgb.shape[1], frame_rgb.shape[0]
+
+        # Let Tkinter update geometry
         self.update_idletasks()
 
+        # Canvas dimensions
         canvas_w = max(self.video_canvas.winfo_width(), 200)
         canvas_h = max(self.video_canvas.winfo_height(), 200)
 
+        # 2) Compute resize scale FIRST
         scale = min(canvas_w / self._render_src_w, canvas_h / self._render_src_h)
         disp_w = max(1, int(self._render_src_w * scale))
         disp_h = max(1, int(self._render_src_h * scale))
         off_x = (canvas_w - disp_w) // 2
         off_y = (canvas_h - disp_h) // 2
 
+        # Store for drawing overlay scale
         self._render_scale = scale
         self._render_off_x = off_x
         self._render_off_y = off_y
         self._render_disp_w = disp_w
         self._render_disp_h = disp_h
 
+        # 3) Resize frame
         try:
             resample = Image.Resampling.LANCZOS
         except AttributeError:
             resample = Image.LANCZOS
-        img_resized = img.resize((disp_w, disp_h), resample)
 
+        pil_img = Image.fromarray(frame_rgb)
+        pil_resized = pil_img.resize((disp_w, disp_h), resample)
+
+        # Convert back to BGR NumPy
+        frame_resized_bgr = cv2.cvtColor(np.array(pil_resized), cv2.COLOR_RGB2BGR)
+
+        # 4) Draw overlay on RESIZED frame
+        frame_resized_bgr = self._draw_pose_overlay(frame_resized_bgr, self.controller.last_body)
+
+        # Convert BGR → RGB for display
+        final_rgb = cv2.cvtColor(frame_resized_bgr, cv2.COLOR_BGR2RGB)
+        final_img = Image.fromarray(final_rgb)
+
+        # 5) Create canvas composite image
         canvas_img = Image.new("RGB", (canvas_w, canvas_h), (18, 18, 18))
-        canvas_img.paste(img_resized, (off_x, off_y))
+        canvas_img.paste(final_img, (off_x, off_y))
 
+        # 6) Push to Tkinter canvas
         self._tk_img = ImageTk.PhotoImage(canvas_img)
 
         if self._canvas_image_id is None:
@@ -710,15 +762,17 @@ class MainWindow(ctk.CTk):
         else:
             self.video_canvas.itemconfigure(self._canvas_image_id, image=self._tk_img)
 
+        # Remove “Load video” text
         if self._canvas_text_id is not None:
             self.video_canvas.delete(self._canvas_text_id)
             self._canvas_text_id = None
 
-        # ROI overlay only when user wants it
+        # ROI overlay in correct location
         if self._roi_mode == "SELECTING" and self._roi_start_canvas and self._roi_end_canvas:
             self._draw_roi_overlay()
         elif self._roi_mode == "DEFINED" and self.controller.roi_defined and self.controller.roi is not None:
             self._update_roi_overlay_from_controller()
+
 
     # -------------------------------------------------------------------------
     # Metrics refresh
